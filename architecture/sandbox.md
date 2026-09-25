@@ -197,6 +197,17 @@ redirect into an allowed subtree.
 See [Sandbox Limits](sandbox-limits.md) for the current numeric safety ceilings,
 their ownership, terminal behavior, and known gaps.
 
+An embedding host may install a per-connection approval hook on the network
+policy engine. It is consulted only for a verified-identity policy denial;
+identity failures, policy errors, fail-closed state, destination validation,
+and later L7 checks remain denials. A one-time approval applies only to that
+handler, while a standing approval must update policy and pass a fresh native
+evaluation. With mediated DNS and a hook installed, an undeclared name can
+receive a short-lived synthetic address without an upstream lookup; its TCP
+open asks using the original hostname and verified binary identity before
+destination resolution. Deferred names have a separate bounded pool and do
+not change the legacy DNS path.
+
 ### Standalone network proxy
 
 `openshell-supervisor --role=network-proxy` runs the policy proxy without an

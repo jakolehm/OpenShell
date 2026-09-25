@@ -726,16 +726,19 @@ async fn preauthorize_transparent_open(
         let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
         return None;
     }
-    if let Some(mapping) = policy_dns_store.and_then(|store| {
-        store
-            .lookup(
-                destination.ip(),
-                destination.port(),
-                opa_engine.current_generation(),
-                std::time::Instant::now(),
-            )
-            .ok()
-    }) {
+    if let Some(mapping) = policy_dns_store
+        .and_then(|store| {
+            store
+                .lookup(
+                    destination.ip(),
+                    destination.port(),
+                    opa_engine.current_generation(),
+                    std::time::Instant::now(),
+                )
+                .ok()
+        })
+        .filter(|mapping| !mapping.record.contracts.is_empty())
+    {
         let Ok(plan) = build_pinned_validation_plan(mapping.pinned_addresses()) else {
             emit_staged_transparent_denial(
                 destination,
@@ -6785,15 +6788,29 @@ mod tests {
 
     struct OneRequestHook(std::sync::atomic::AtomicUsize);
 
-    fn approval_identity() -> std::result::Result<ContractBinaryIdentity, ResolveError> {
-        Ok(ContractBinaryIdentity {
+    fn approval_identity() -> ContractBinaryIdentity {
+        ContractBinaryIdentity {
             executable: ContractExecutableIdentity {
                 path: PathBuf::from("/usr/bin/curl"),
                 digest: Some("00".repeat(32).parse().unwrap()),
             },
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
-        })
+        }
+    }
+
+    struct CaptureDenyHook(std::sync::Mutex<Vec<(String, u16, PathBuf)>>);
+
+    #[async_trait::async_trait]
+    impl ConnectionApprovalHook for CaptureDenyHook {
+        async fn approve(&self, input: &crate::opa::NetworkInput) -> ConnectionApprovalOutcome {
+            self.0.lock().unwrap().push((
+                input.host.clone(),
+                input.port,
+                input.binary_path.clone(),
+            ));
+            ConnectionApprovalOutcome::Deny
+        }
     }
 
     #[async_trait::async_trait]
@@ -6846,7 +6863,7 @@ mod tests {
                 std::sync::atomic::AtomicUsize::new(0),
             )))
             .unwrap();
-        let identity = approval_identity();
+        let identity = Ok(approval_identity());
         let identity_cache = BinaryIdentityCache::new();
         let evaluate = || {
             authorize_supplied_identity(
@@ -6874,7 +6891,7 @@ mod tests {
         .unwrap();
         let hook = Arc::new(OneRequestHook(std::sync::atomic::AtomicUsize::new(0)));
         engine.set_connection_approval_hook(hook.clone()).unwrap();
-        let mut identity = approval_identity().unwrap();
+        let mut identity = approval_identity();
         identity.ancestors.push(ContractExecutableIdentity {
             path: PathBuf::from("/usr/bin/sh"),
             digest: None,
@@ -6904,7 +6921,7 @@ mod tests {
         engine
             .set_connection_approval_hook(Arc::new(QuarantineDuringApproval(engine.clone())))
             .unwrap();
-        let identity = approval_identity();
+        let identity = Ok(approval_identity());
         let identity_cache = BinaryIdentityCache::new();
         let denied = authorize_supplied_identity(
             &engine,
@@ -6941,7 +6958,7 @@ network_policies:
 "#,
             }))
             .unwrap();
-        let identity = approval_identity();
+        let identity = Ok(approval_identity());
         let identity_cache = BinaryIdentityCache::new();
         let denied = authorize_supplied_identity(
             &engine,
@@ -6970,7 +6987,7 @@ network_policies:
             (
                 PendingTcpOpen {
                     stream: Box::new(stream),
-                    binary_identity: approval_identity(),
+                    binary_identity: Ok(approval_identity()),
                     destination: "8.8.8.8:443".parse().unwrap(),
                     socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
                         socket_cookie: 7,
@@ -7024,6 +7041,75 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn deferred_dns_mapping_asks_for_hostname_and_binary_at_tcp_open() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../data/sandbox-policy.rego"),
+            "network_policies: {}\n",
+        )
+        .unwrap();
+        let hook = Arc::new(CaptureDenyHook(std::sync::Mutex::new(Vec::new())));
+        engine.set_connection_approval_hook(hook.clone()).unwrap();
+        let pools = crate::policy_dns::SyntheticPools::new(
+            Ipv4Addr::new(198, 18, 0, 2)..=Ipv4Addr::new(198, 18, 0, 2),
+            "fd00:1::1".parse().unwrap()..="fd00:1::1".parse().unwrap(),
+        )
+        .unwrap();
+        let store = Arc::new(ResolvedEndpointStore::new(
+            crate::policy_dns::StoreConfig::new(pools, 1).unwrap(),
+        ));
+        let record = store
+            .publish_deferred(
+                crate::policy_dns::NormalizedName::parse("unknown.example.test").unwrap(),
+                crate::policy_dns::AddressFamily::Ipv4,
+                engine.current_generation(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        let (stream, _peer) = tokio::io::duplex(64);
+        let (decision, completion) = tokio::sync::oneshot::channel();
+        let pending = PendingTcpOpen {
+            stream: Box::new(stream),
+            binary_identity: Ok(approval_identity()),
+            destination: SocketAddr::new(record.synthetic_address, 443),
+            socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
+                socket_cookie: 7,
+                nonblocking: false,
+                process_generation: 1,
+            },
+            policy_generation: engine.current_generation(),
+            timing: MediationTiming::default(),
+            decision,
+        };
+
+        assert!(
+            preauthorize_transparent_open(
+                pending,
+                Some(&store),
+                &engine,
+                &BinaryIdentityCache::new(),
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(
+            completion.await.unwrap(),
+            TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied)
+        );
+        assert_eq!(
+            *hook.0.lock().unwrap(),
+            [(
+                "unknown.example.test".to_string(),
+                443,
+                PathBuf::from("/usr/bin/curl")
+            )]
+        );
+    }
+
+    #[tokio::test]
     async fn supplied_identity_connect_and_forward_handlers_use_the_hook() {
         for request in [
             "CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1:80\r\n\r\n",
@@ -7038,7 +7124,7 @@ network_policies:
             );
             let hook = Arc::new(OneRequestHook(std::sync::atomic::AtomicUsize::new(0)));
             engine.set_connection_approval_hook(hook.clone()).unwrap();
-            let identity = approval_identity();
+            let identity = Ok(approval_identity());
             let (server, mut peer) = tokio::io::duplex(4096);
             let handler = handle_mediated_connection(
                 tokio::io::BufReader::new(Box::new(server)),
@@ -7069,8 +7155,8 @@ network_policies:
                 peer.read_to_end(&mut response).await.unwrap();
                 response
             };
-            let (handled, response) = tokio::join!(handler, client);
-            handled.unwrap();
+            let (handler_result, response) = tokio::join!(handler, client);
+            handler_result.unwrap();
             assert_eq!(hook.0.load(Ordering::SeqCst), 1);
             assert!(String::from_utf8_lossy(&response).contains("ssrf_denied"));
         }

@@ -233,6 +233,7 @@ struct AllocationKey {
     normalized_name: NormalizedName,
     family: AddressFamily,
     allocation_identity: [u8; 32],
+    deferred: bool,
 }
 
 struct StoreState {
@@ -282,11 +283,43 @@ impl ResolvedEndpointStore {
         current_policy_generation: u64,
         now: Instant,
     ) -> Result<ResolvedEndpointRecord, PublishError> {
+        self.publish_inner(request, current_policy_generation, now, false)
+    }
+
+    pub(crate) fn publish_deferred(
+        &self,
+        normalized_name: NormalizedName,
+        family: AddressFamily,
+        current_policy_generation: u64,
+        now: Instant,
+    ) -> Result<ResolvedEndpointRecord, PublishError> {
+        self.publish_inner(
+            PublishRequest {
+                normalized_name,
+                family,
+                allocation_identity: [0; 32],
+                policy_generation: current_policy_generation,
+                ttl: super::MAX_MAPPING_TTL,
+                contracts: Vec::new(),
+            },
+            current_policy_generation,
+            now,
+            true,
+        )
+    }
+
+    fn publish_inner(
+        &self,
+        request: PublishRequest,
+        current_policy_generation: u64,
+        now: Instant,
+        deferred: bool,
+    ) -> Result<ResolvedEndpointRecord, PublishError> {
         if request.policy_generation != current_policy_generation {
             return Err(PublishError::StalePolicy);
         }
         if request.ttl.is_zero()
-            || request.contracts.is_empty()
+            || (request.contracts.is_empty() != deferred)
             || request.contracts.iter().any(|contract| {
                 contract.port == 0
                     || contract.pinned_addresses.is_empty()
@@ -303,6 +336,7 @@ impl ResolvedEndpointStore {
             normalized_name: request.normalized_name.clone(),
             family: request.family,
             allocation_identity: request.allocation_identity,
+            deferred,
         };
         let mut state = self.state.write().map_err(|_| PublishError::LockPoisoned)?;
         let synthetic_address = if let Some(address) = state.allocations.get(&key) {
@@ -310,6 +344,22 @@ impl ResolvedEndpointStore {
         } else {
             if state.allocations.len() >= self.config.max_mappings {
                 return Err(PublishError::PoolExhausted);
+            }
+            if deferred {
+                let deferred_capacity = self
+                    .config
+                    .pools
+                    .capacity(request.family)
+                    .min(self.config.max_mappings)
+                    .div_ceil(4);
+                let allocated_deferred = state
+                    .allocations
+                    .keys()
+                    .filter(|key| key.deferred && key.family == request.family)
+                    .count();
+                if allocated_deferred >= deferred_capacity {
+                    return Err(PublishError::PoolExhausted);
+                }
             }
             let address =
                 allocate_address(&mut state, request.family).ok_or(PublishError::PoolExhausted)?;
@@ -392,10 +442,12 @@ impl ResolvedEndpointStore {
         if record.policy_generation != current_policy_generation {
             return Err(MappingLookupError::StalePolicy);
         }
-        if !record
-            .contracts
-            .iter()
-            .any(|contract| contract.port == port)
+        if port == 0
+            || (!record.contracts.is_empty()
+                && !record
+                    .contracts
+                    .iter()
+                    .any(|contract| contract.port == port))
         {
             return Err(MappingLookupError::PortMismatch);
         }

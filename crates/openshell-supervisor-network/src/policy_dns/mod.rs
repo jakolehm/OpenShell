@@ -88,6 +88,7 @@ pub(crate) struct PolicyDnsService<R> {
     resolver: R,
     store: Arc<ResolvedEndpointStore>,
     trusted_host_gateway: Option<std::net::IpAddr>,
+    deferred_dns_approval: bool,
 }
 
 impl<R: TrustedResolver> PolicyDnsService<R> {
@@ -102,7 +103,13 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             resolver,
             store,
             trusted_host_gateway,
+            deferred_dns_approval: false,
         }
+    }
+
+    pub(crate) fn with_deferred_dns_approval(mut self) -> Self {
+        self.deferred_dns_approval = true;
+        self
     }
 
     pub(crate) async fn answer_query(
@@ -144,6 +151,35 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             self.trusted_host_gateway,
         )?;
         if eligible.is_empty() {
+            if self.deferred_dns_approval
+                && !is_host_gateway_alias(normalized_name.as_str())
+                && self
+                    .policy
+                    .connection_approval_hook()
+                    .map_err(|error| PolicyDnsError::Policy(error.to_string()))?
+                    .is_some()
+            {
+                let record = self
+                    .policy
+                    .with_current_generation(snapshot.generation, |current_generation| {
+                        self.store.publish_deferred(
+                            normalized_name.clone(),
+                            family,
+                            current_generation,
+                            now,
+                        )
+                    })
+                    .map_err(|error| PolicyDnsError::Policy(error.to_string()))?
+                    .ok_or(PolicyDnsError::StalePolicy)??;
+                emit_mapping_publication(&record);
+                return Ok(SyntheticAnswer {
+                    address: record.synthetic_address,
+                    ttl: MAX_MAPPING_TTL,
+                    mapping_id: record.mapping_id,
+                    mapping_generation: record.mapping_generation,
+                    policy_generation: record.policy_generation,
+                });
+            }
             emit_dns_denial(
                 &normalized_name,
                 "policy_dns_ineligible",
@@ -552,6 +588,7 @@ fn build_mapping_publication_event(record: &ResolvedEndpointRecord) -> openshell
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opa::{ConnectionApprovalHook, ConnectionApprovalOutcome, NetworkInput};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
@@ -562,6 +599,15 @@ mod tests {
     }
 
     struct NxDomainResolver;
+
+    struct DenyApproval;
+
+    #[async_trait::async_trait]
+    impl ConnectionApprovalHook for DenyApproval {
+        async fn approve(&self, _input: &NetworkInput) -> ConnectionApprovalOutcome {
+            ConnectionApprovalOutcome::Deny
+        }
+    }
 
     impl TrustedResolver for NxDomainResolver {
         async fn resolve(
@@ -655,6 +701,106 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .await;
         assert!(matches!(result, Err(PolicyDnsError::Ineligible)));
         assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_dns_refuses_unknown_name_even_with_an_approval_hook() {
+        let service = service(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()]);
+        service
+            .policy
+            .set_connection_approval_hook(Arc::new(DenyApproval))
+            .unwrap();
+
+        assert!(matches!(
+            service
+                .answer_query("other.example", AddressFamily::Ipv4, Instant::now())
+                .await,
+            Err(PolicyDnsError::Ineligible)
+        ));
+        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn approval_hook_defers_unknown_dns_until_tcp_authorization() {
+        let service =
+            service(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()]).with_deferred_dns_approval();
+        service
+            .policy
+            .set_connection_approval_hook(Arc::new(DenyApproval))
+            .unwrap();
+        let now = Instant::now();
+
+        let answer = service
+            .answer_query("OTHER.EXAMPLE.", AddressFamily::Ipv4, now)
+            .await
+            .unwrap();
+        let mapping = service
+            .store
+            .lookup(answer.address, 443, answer.policy_generation, now)
+            .unwrap();
+
+        assert_eq!(mapping.record.normalized_name.as_str(), "other.example");
+        assert!(mapping.record.contracts.is_empty());
+        assert!(
+            service
+                .store
+                .lookup(answer.address, 80, answer.policy_generation, now)
+                .is_ok()
+        );
+        assert!(matches!(
+            service
+                .store
+                .lookup(answer.address, 0, answer.policy_generation, now),
+            Err(MappingLookupError::PortMismatch)
+        ));
+        assert!(matches!(
+            service
+                .store
+                .lookup(answer.address, 443, answer.policy_generation + 1, now),
+            Err(MappingLookupError::StalePolicy)
+        ));
+        assert!(matches!(
+            service.store.lookup(
+                answer.address,
+                443,
+                answer.policy_generation,
+                now + MAX_MAPPING_TTL
+            ),
+            Err(MappingLookupError::Expired)
+        ));
+        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_dns_cannot_exhaust_the_pool_reserved_for_declared_endpoints() {
+        let service =
+            service(BASE_POLICY, vec!["8.8.8.8".parse().unwrap()]).with_deferred_dns_approval();
+        service
+            .policy
+            .set_connection_approval_hook(Arc::new(DenyApproval))
+            .unwrap();
+        let now = Instant::now();
+        for name in ["first.example", "second.example"] {
+            assert!(
+                service
+                    .answer_query(name, AddressFamily::Ipv4, now)
+                    .await
+                    .is_ok()
+            );
+        }
+
+        assert!(matches!(
+            service
+                .answer_query("third.example", AddressFamily::Ipv4, now)
+                .await,
+            Err(PolicyDnsError::Publish(PublishError::PoolExhausted))
+        ));
+        assert!(
+            service
+                .answer_query("db.example", AddressFamily::Ipv4, now)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -824,6 +970,31 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             ));
             assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn approval_hook_does_not_defer_an_undeclared_gateway_alias() {
+        let service = service_with_gateway(
+            BASE_POLICY,
+            vec!["8.8.8.8".parse().unwrap()],
+            Some("172.23.0.1".parse().unwrap()),
+        )
+        .with_deferred_dns_approval();
+        service
+            .policy
+            .set_connection_approval_hook(Arc::new(DenyApproval))
+            .unwrap();
+
+        let result = service
+            .answer_query(
+                "host.openshell.internal",
+                AddressFamily::Ipv4,
+                Instant::now(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(PolicyDnsError::Ineligible)));
+        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

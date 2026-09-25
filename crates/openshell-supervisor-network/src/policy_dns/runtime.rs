@@ -104,12 +104,15 @@ impl PolicyDnsRuntime {
             StoreConfig::new(config.pools, MAX_MAPPINGS)
                 .map_err(|error| miette::miette!(error.to_string()))?,
         ));
-        let service = Arc::new(PolicyDnsService::new(
-            policy,
-            SocketTrustedResolver::new(upstream),
-            store.clone(),
-            trusted_host_gateway,
-        ));
+        let service = Arc::new(
+            PolicyDnsService::new(
+                policy,
+                SocketTrustedResolver::new(upstream),
+                store.clone(),
+                trusted_host_gateway,
+            )
+            .with_deferred_dns_approval(),
+        );
         let task = tokio::spawn(async move {
             if engine_ready.wait_for(|ready| *ready).await.is_err() {
                 return;
