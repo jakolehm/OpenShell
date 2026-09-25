@@ -99,6 +99,18 @@ pub struct NetworkInput {
     pub cmdline_paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionApprovalOutcome {
+    Deny,
+    AllowOnce,
+    Reevaluate,
+}
+
+#[async_trait::async_trait]
+pub trait ConnectionApprovalHook: Send + Sync {
+    async fn approve(&self, input: &NetworkInput) -> ConnectionApprovalOutcome;
+}
+
 fn inject_runtime_policy_data(data: &mut serde_json::Value, require_binary_identity: bool) {
     let Some(obj) = data.as_object_mut() else {
         return;
@@ -147,6 +159,7 @@ pub struct SandboxConfig {
 /// because policy evaluation is fast (microseconds) and contention is low
 /// (one eval per CONNECT request).
 pub struct OpaEngine {
+    connection_approval_hook: RwLock<Option<Arc<dyn ConnectionApprovalHook>>>,
     engine: Mutex<regorus::Engine>,
     binary_identity_required: bool,
     generation: Arc<AtomicU64>,
@@ -281,6 +294,7 @@ impl OpaEngine {
         let generation = Arc::new(AtomicU64::new(0));
         let (generation_tx, _) = watch::channel(0);
         Self {
+            connection_approval_hook: RwLock::new(None),
             engine: Mutex::new(engine),
             binary_identity_required,
             generation,
@@ -294,6 +308,27 @@ impl OpaEngine {
     /// Whether network authorization requires a workload binary identity.
     pub const fn binary_identity_required(&self) -> bool {
         self.binary_identity_required
+    }
+
+    pub fn set_connection_approval_hook(
+        &self,
+        hook: Arc<dyn ConnectionApprovalHook>,
+    ) -> Result<()> {
+        *self
+            .connection_approval_hook
+            .write()
+            .map_err(|_| miette::miette!("connection approval hook lock poisoned"))? = Some(hook);
+        Ok(())
+    }
+
+    pub(crate) fn connection_approval_hook(
+        &self,
+    ) -> Result<Option<Arc<dyn ConnectionApprovalHook>>> {
+        Ok(self
+            .connection_approval_hook
+            .read()
+            .map_err(|_| miette::miette!("connection approval hook lock poisoned"))?
+            .clone())
     }
 
     fn advance_generation(&self) -> u64 {
