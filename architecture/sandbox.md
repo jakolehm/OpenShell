@@ -205,8 +205,12 @@ handler, while a standing approval must update policy and pass a fresh native
 evaluation. With mediated DNS and a hook installed, an undeclared name can
 receive a short-lived synthetic address without an upstream lookup; its TCP
 open asks using the original hostname and verified binary identity before
-destination resolution. Deferred names have a separate bounded pool and do
-not change the legacy DNS path.
+destination resolution. Deferred approval records remain distinct from
+upstream's observation-only records, which never authorize egress; both share
+the bounded unknown-name allocation budget. Reserved names and quarantine
+remain refused. A policy-generation change invalidates a deferred mapping,
+so a standing approval that changes policy requires DNS resolution and a
+connection retry. The legacy DNS path keeps upstream's observation behavior.
 
 ### Standalone network proxy
 
@@ -280,8 +284,9 @@ Input mediation, DNS/TCP authorization, and outer-fence enforcement are
 identical in both modes. The selected mode is emitted in the sandbox
 qualification output (`seccomp_listener_mode`).
 
-DNS uses an exact sandbox-local resolver at `127.0.0.53:53`. The driver sets the
-nameserver and permits an unprivileged bind to port 53. UDP and TCP DNS requests
+DNS uses an exact sandbox-local resolver at `127.0.0.53:53`. The driver sets that
+nameserver without search domains, so names reach policy DNS as the workload
+wrote them, and permits an unprivileged bind to port 53. UDP and TCP DNS requests
 are forwarded through the supervisor, which applies hostname-based DNS policy.
 The Podman driver supplies that resolver configuration as a driver-owned,
 read-only secret mounted at `/etc/resolv.conf`; the workload remains on
@@ -334,10 +339,12 @@ preserves this lifetime rule; persistent responses remain eligible for reuse.
 An explicit `protocol: tcp` endpoint with a valid DNS hostname opts into native
 DNS and transparent TCP when the selected runtime advertises that substrate.
 Hostless `allowed_ips` and literal-IP selectors remain available only to the
-legacy explicit-proxy path when `protocol` is omitted. The shared supervisor
-answers only eligible DNS names, returns an epoch-scoped synthetic address, and
+legacy explicit-proxy path when `protocol` is omitted. For an eligible DNS
+name, the shared supervisor returns an epoch-scoped synthetic address and
 publishes the expiring name, endpoint, ports, policy generation, and validated
-real addresses as one correlation. A connection to that synthetic address is
+real addresses as one correlation. A name absent from policy receives at most a
+contract-free observation address for policy advisor proposals; see
+[Security Policy](security-policy.md). A connection to that synthetic address is
 captured before the bypass fence, mapped back to its workload process, authorized
 through the same egress pipeline, and dialed only through the pinned addresses.
 Omitted protocol endpoints retain explicit-proxy behavior.
