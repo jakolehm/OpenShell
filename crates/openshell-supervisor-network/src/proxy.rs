@@ -647,16 +647,19 @@ async fn preauthorize_transparent_open(
         let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
         return None;
     }
-    if let Some(mapping) = policy_dns_store.and_then(|store| {
-        store
-            .lookup(
-                destination.ip(),
-                destination.port(),
-                opa_engine.current_generation(),
-                std::time::Instant::now(),
-            )
-            .ok()
-    }) {
+    if let Some(mapping) = policy_dns_store
+        .and_then(|store| {
+            store
+                .lookup(
+                    destination.ip(),
+                    destination.port(),
+                    opa_engine.current_generation(),
+                    std::time::Instant::now(),
+                )
+                .ok()
+        })
+        .filter(|mapping| !mapping.record.contracts.is_empty())
+    {
         let Ok(plan) = build_pinned_validation_plan(mapping.pinned_addresses()) else {
             emit_staged_transparent_denial(
                 destination,
@@ -6610,6 +6613,20 @@ mod tests {
 
     struct OneRequestHook(std::sync::atomic::AtomicUsize);
 
+    struct CaptureDenyHook(std::sync::Mutex<Vec<(String, u16, PathBuf)>>);
+
+    #[async_trait::async_trait]
+    impl ConnectionApprovalHook for CaptureDenyHook {
+        async fn approve(&self, input: &crate::opa::NetworkInput) -> ConnectionApprovalOutcome {
+            self.0.lock().unwrap().push((
+                input.host.clone(),
+                input.port,
+                input.binary_path.clone(),
+            ));
+            ConnectionApprovalOutcome::Deny
+        }
+    }
+
     #[async_trait::async_trait]
     impl ConnectionApprovalHook for OneRequestHook {
         async fn approve(&self, _input: &crate::opa::NetworkInput) -> ConnectionApprovalOutcome {
@@ -6801,6 +6818,71 @@ network_policies:
             TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied)
         );
         assert_eq!(hook.0.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn deferred_dns_mapping_asks_for_hostname_and_binary_at_tcp_open() {
+        let engine = OpaEngine::from_strings(
+            include_str!("../data/sandbox-policy.rego"),
+            "network_policies: {}\n",
+        )
+        .unwrap();
+        let hook = Arc::new(CaptureDenyHook(std::sync::Mutex::new(Vec::new())));
+        engine.set_connection_approval_hook(hook.clone()).unwrap();
+        let pools = crate::policy_dns::SyntheticPools::new(
+            Ipv4Addr::new(198, 18, 0, 1)..=Ipv4Addr::new(198, 18, 0, 1),
+            "fd00:1::1".parse().unwrap()..="fd00:1::1".parse().unwrap(),
+        )
+        .unwrap();
+        let store = Arc::new(ResolvedEndpointStore::new(
+            crate::policy_dns::StoreConfig::new(pools, 1).unwrap(),
+        ));
+        let record = store
+            .publish_deferred(
+                crate::policy_dns::NormalizedName::parse("unknown.example.test").unwrap(),
+                crate::policy_dns::AddressFamily::Ipv4,
+                engine.current_generation(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        let (stream, _peer) = tokio::io::duplex(64);
+        let (decision, completion) = tokio::sync::oneshot::channel();
+        let pending = PendingTcpOpen {
+            stream: Box::new(stream),
+            binary_identity: Ok(ContractBinaryIdentity {
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_digest: Some("00".repeat(32).parse().unwrap()),
+                ancestors: Vec::new(),
+                cmdline_paths: Vec::new(),
+            }),
+            destination: SocketAddr::new(record.synthetic_address, 443),
+            socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
+                socket_cookie: 7,
+                nonblocking: false,
+                process_generation: 1,
+            },
+            policy_generation: engine.current_generation(),
+            timing: MediationTiming::default(),
+            decision,
+        };
+
+        assert!(
+            preauthorize_transparent_open(pending, Some(&store), &engine, None, None)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            completion.await.unwrap(),
+            TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied)
+        );
+        assert_eq!(
+            *hook.0.lock().unwrap(),
+            [(
+                "unknown.example.test".to_string(),
+                443,
+                PathBuf::from("/usr/bin/curl")
+            )]
+        );
     }
 
     #[tokio::test]
